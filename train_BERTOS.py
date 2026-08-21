@@ -1,708 +1,570 @@
-# Copyright 2021 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Train BERTOS
-"""
-
-import argparse
-import json
-import logging
-import math
 import os
 import random
-from pathlib import Path
-
-import datasets
+import numpy as np
 import torch
-from datasets import ClassLabel, load_dataset
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
-import evaluate
-import transformers
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import set_seed
-from huggingface_hub import Repository
+from datasets import Dataset, DatasetDict
+from torch.utils.data import DataLoader
 from transformers import (
+    BertTokenizerFast,
     AutoConfig,
     AutoModelForTokenClassification,
     DataCollatorForTokenClassification,
-    PretrainedConfig,
-    SchedulerType,
-    default_data_collator,
     get_scheduler,
 )
-from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
-from transformers.utils.versions import require_version
+from tqdm.auto import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-from transformers import BertTokenizerFast
+# ============================================================
+# Configuration
+# ============================================================
 
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.23.0.dev0")
+DATA_ROOT = "./dataset/ICSD_CN"
+TRAIN_FILE = "train.txt"
+VALIDATION_FILE = "validation.txt"
+TEST_FILE = "test.txt"
 
-logger = get_logger(__name__)
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/token-classification/requirements.txt")
+TOKENIZER_PATH = "./tokenizer"
+CONFIG_PATH="./random_config"
+OUTPUT_DIR = "./trained_model"
+
+MAX_LENGTH = 100
+TRAIN_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 64
+
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 0.0
+NUM_EPOCHS = 500
+EARLY_STOPPING_PATIENCE = 20
+
+SEED = 42
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train BERTOS"
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help="The name of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--text_column_name",
-        type=str,
-        default=None,
-        help="The column name of text to input in the file (a csv or JSON file).",
-    )
-    parser.add_argument(
-        "--label_column_name",
-        type=str,
-        default=None,
-        help="The column name of label to input in the file (a csv or JSON file).",
-    )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=128,
-        help=(
-            "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
-            " sequences shorter will be padded if `--pad_to_max_length` is passed."
-        ),
-    )
-    parser.add_argument(
-        "--pad_to_max_length",
-        action="store_true",
-        help="If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.",
-    )
-    parser.add_argument(
-        "--model_name_or_path",
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
-        "--config_name",
-        type=str,
-        default=None,
-        help="Pretrained config name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default='./tokenizer',
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--per_device_train_batch_size",
-        type=int,
-        default=8,
-        help="Batch size (per device) for the training dataloader.",
-    )
-    parser.add_argument(
-        "--per_device_eval_batch_size",
-        type=int,
-        default=8,
-        help="Batch size (per device) for the evaluation dataloader.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=5e-5,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
-    parser.add_argument(
-        "--max_train_steps",
-        type=int,
-        default=None,
-        help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--lr_scheduler_type",
-        type=SchedulerType,
-        default="linear",
-        help="The scheduler type to use.",
-        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
-    )
-    parser.add_argument(
-        "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
-    )
-    parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument(
-        "--label_all_tokens",
-        action="store_true",
-        help="Setting labels of all special tokens to -100 and thus PyTorch will ignore them.",
-    )
-    parser.add_argument(
-        "--return_entity_level_metrics",
-        action="store_true",
-        help="Indication whether entity level metrics are to be returner.",
-    )
-    parser.add_argument(
-        "--task_name",
-        type=str,
-        default="ner",
-        choices=["ner", "pos", "chunk"],
-        help="The name of the task.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Activate debug mode and run training only with a subset of data.",
-    )
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument(
-        "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
-    )
-    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help="If the training should continue from a checkpoint folder.",
-    )
-    parser.add_argument(
-        "--with_tracking",
-        action="store_true",
-        help="Whether to enable experiment trackers for logging.",
-    )
-    parser.add_argument(
-        "--report_to",
-        type=str,
-        default="all",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
-            ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
-            "Only applicable when `--with_tracking` is passed."
-        ),
-    )
-    parser.add_argument(
-        "--ignore_mismatched_sizes",
-        action="store_true",
-        help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
-    )
-    args = parser.parse_args()
+# ============================================================
+# Labels
+# ============================================================
 
-    # Sanity checks
-    if args.push_to_hub:
-        assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
+LABEL_LIST = [
+    "-5",
+    "-4",
+    "-3",
+    "-2",
+    "-1",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+]
 
-    return args
+LABEL_TO_ID = {
+    label: i
+    for i, label in enumerate(LABEL_LIST)
+}
 
+ID_TO_LABEL = {
+    i: label
+    for i, label in enumerate(LABEL_LIST)
+}
+
+
+# ============================================================
+# Random seed
+# ============================================================
+
+def set_seed(seed):
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        print("CUDA available")
+        torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# Read BERTOS txt dataset
+# ============================================================
+
+def read_materials_file(filepath):
+
+    examples = []
+
+    tokens = []
+    ner_tags = []
+
+    guid = 0
+
+    with open(filepath, encoding="utf-8") as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            # Empty line -> end of one material
+            if not line:
+
+                if tokens:
+
+                    examples.append(
+                        {
+                            "id": str(guid),
+                            "tokens": tokens,
+                            "ner_tags": ner_tags,
+                        }
+                    )
+
+                    guid += 1
+                    tokens = []
+                    ner_tags = []
+
+                continue
+
+            # Original format:
+            # token oxidation_state
+            splits = line.split()
+
+            tokens.append(splits[0])
+            ner_tags.append(splits[1])
+
+    # Last example
+    if tokens:
+
+        examples.append(
+            {
+                "id": str(guid),
+                "tokens": tokens,
+                "ner_tags": ner_tags,
+            }
+        )
+
+    return examples
+
+
+# ============================================================
+# Load dataset
+# ============================================================
+
+def load_materials_dataset():
+
+    train_data = read_materials_file(
+        os.path.join(DATA_ROOT, TRAIN_FILE)
+    )
+
+    validation_data = read_materials_file(
+        os.path.join(DATA_ROOT, VALIDATION_FILE)
+    )
+
+    test_data = read_materials_file(
+        os.path.join(DATA_ROOT, TEST_FILE)
+    )
+
+    dataset = DatasetDict(
+        {
+            "train": Dataset.from_list(train_data),
+            "validation": Dataset.from_list(validation_data),
+            "test": Dataset.from_list(test_data),
+        }
+    )
+
+    return dataset
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    args = parse_args()
 
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_ner_no_trainer", args)
+    set_seed(SEED)
 
-    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
-    # in the environment
-    accelerator = (
-        Accelerator(log_with=args.report_to, logging_dir=args.output_dir) if args.with_tracking else Accelerator()
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
     )
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+
+    writer = SummaryWriter(log_dir=os.path.join(OUTPUT_DIR, "./runs/"))
+
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
-    logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed)
+    print("Device:", device)
 
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-    accelerator.wait_for_everyone()
-
-
-    ## load dataset
-    if not args.dataset_name:
-        raise ValueError(
-            "Please give dataset file"
-        )
-        
-    raw_datasets = load_dataset(args.dataset_name)
-
-    # Trim a number of training examples
-    if args.debug:
-        for split in raw_datasets.keys():
-            raw_datasets[split] = raw_datasets[split].select(range(100))
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
-
-    if raw_datasets["train"] is not None:
-        column_names = raw_datasets["train"].column_names
-        features = raw_datasets["train"].features
-    else:
-        column_names = raw_datasets["validation"].column_names
-        features = raw_datasets["validation"].features
-
-    if args.text_column_name is not None:
-        text_column_name = args.text_column_name
-    elif "tokens" in column_names:
-        text_column_name = "tokens"
-    else:
-        text_column_name = column_names[0]
-
-    if args.label_column_name is not None:
-        label_column_name = args.label_column_name
-    elif f"{args.task_name}_tags" in column_names:
-        label_column_name = f"{args.task_name}_tags"
-    else:
-        label_column_name = column_names[1]
-
-    # In the event the labels are not a `Sequence[ClassLabel]`, we will need to go through the dataset to get the
-    # unique labels.
-    def get_label_list(labels):
-        unique_labels = set()
-        for label in labels:
-            unique_labels = unique_labels | set(label)
-        label_list = list(unique_labels)
-        label_list.sort()
-        return label_list
-
-    # If the labels are of type ClassLabel, they are already integers and we have the map stored somewhere.
-    # Otherwise, we have to get the list of labels manually.
-    labels_are_int = isinstance(features[label_column_name].feature, ClassLabel)
-    if labels_are_int:
-        label_list = features[label_column_name].feature.names
-        label_to_id = {i: i for i in range(len(label_list))}
-    else:
-        label_list = get_label_list(raw_datasets["train"][label_column_name])
-        label_to_id = {l: i for i, l in enumerate(label_list)}
-
-    num_labels = len(label_list)
-
-    # Load pretrained model and tokenizer
-    ##prepare config file (BERT)
-    config = AutoConfig.from_pretrained(args.config_name, num_labels=num_labels)
-    
-    ##load tokenizer
-    tokenizer_name_or_path = args.tokenizer_name
-    if not tokenizer_name_or_path:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+    if torch.cuda.is_available():
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0)
         )
 
-    tokenizer = BertTokenizerFast.from_pretrained(tokenizer_name_or_path, do_lower_case=False)
-    
-    logger.info("Training new model from scratch")
-    model = AutoModelForTokenClassification.from_config(config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    # --------------------------------------------------------
+    # Load dataset
+    # --------------------------------------------------------
 
-    # Model has labels -> use them.
-    if model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id:
-        if list(sorted(model.config.label2id.keys())) == list(sorted(label_list)):
-            # Reorganize `label_list` to match the ordering of the model.
-            if labels_are_int:
-                label_to_id = {i: int(model.config.label2id[l]) for i, l in enumerate(label_list)}
-                label_list = [model.config.id2label[i] for i in range(num_labels)]
-            else:
-                label_list = [model.config.id2label[i] for i in range(num_labels)]
-                label_to_id = {l: i for i, l in enumerate(label_list)}
-        else:
-            logger.warning(
-                "Your model seems to have been trained with labels, but they don't match the dataset: ",
-                f"model labels: {list(sorted(model.config.label2id.keys()))}, dataset labels:"
-                f" {list(sorted(label_list))}.\nIgnoring the model labels as a result.",
-            )
+    print("\nLoading dataset...")
 
-    # Set the correspondences label/ID inside the model config
-    model.config.label2id = {l: i for i, l in enumerate(label_list)}
-    model.config.id2label = {i: l for i, l in enumerate(label_list)}
+    raw_datasets = load_materials_dataset()
 
-    # Map that sends B-Xxx label to its I-Xxx counterpart
-    b_to_i_label = []
+    # print(raw_datasets)
 
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
-    padding = "max_length" if args.pad_to_max_length else False
+    print(
+        "Training samples:",
+        len(raw_datasets["train"])
+    )
 
-    # Tokenize all texts and align the labels with them.
+    print(
+        "Validation samples:",
+        len(raw_datasets["validation"])
+    )
+
+    print(
+        "Test samples:",
+        len(raw_datasets["test"])
+    )
+
+
+    # --------------------------------------------------------
+    # Load tokenizer
+    # --------------------------------------------------------
+
+    print("\nLoading tokenizer...")
+
+    tokenizer = BertTokenizerFast.from_pretrained(
+        TOKENIZER_PATH,
+        do_lower_case=False,
+    )
+
+    print(
+        "Vocabulary size:",
+        len(tokenizer)
+    )
+
+
+    # --------------------------------------------------------
+    # Model configuration
+    # --------------------------------------------------------
+
+    config = AutoConfig.from_pretrained(
+        CONFIG_PATH,
+        num_labels=len(LABEL_LIST),
+        label2id=LABEL_TO_ID,
+        id2label=ID_TO_LABEL,
+    )
+
+
+    # --------------------------------------------------------
+    # Create model
+    # --------------------------------------------------------
+
+    print("\nCreating BERTOS model...")
+
+    model = AutoModelForTokenClassification.from_config(
+        config
+    )
+
+    model.resize_token_embeddings(
+        len(tokenizer)
+    )
+
+    model.to(device)
+
+
+    # --------------------------------------------------------
+    # Tokenization and label alignment
+    # --------------------------------------------------------
 
     def tokenize_and_align_labels(examples):
+
         tokenized_inputs = tokenizer(
-            examples[text_column_name],
-            max_length=args.max_length,
-            padding=padding,
+            examples["tokens"],
+            max_length=MAX_LENGTH,
+            padding=False,
             truncation=True,
-            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
             is_split_into_words=True,
         )
 
         labels = []
-        for i, label in enumerate(examples[label_column_name]):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)
+
+        for i, label in enumerate(
+            examples["ner_tags"]
+        ):
+
+            word_ids = tokenized_inputs.word_ids(
+                batch_index=i
+            )
+
             previous_word_idx = None
+
             label_ids = []
+
             for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
+
+                # Special token
                 if word_idx is None:
+
                     label_ids.append(-100)
-                # We set the label for the first token of each word.
+
+                # First sub-token
                 elif word_idx != previous_word_idx:
-                    label_ids.append(label_to_id[label[word_idx]])
-                # For the other tokens in a word, we set the label to either the current label or -100, depending on
-                # the label_all_tokens flag.
+
+                    label_ids.append(
+                        LABEL_TO_ID[
+                            str(label[word_idx])
+                        ]
+                    )
+
+                # Other sub-token
                 else:
-                    if args.label_all_tokens:
-                        label_ids.append(b_to_i_label[label_to_id[label[word_idx]]])
-                    else:
-                        label_ids.append(-100)
+
+                    label_ids.append(-100)
+
                 previous_word_idx = word_idx
 
             labels.append(label_ids)
+
         tokenized_inputs["labels"] = labels
+
         return tokenized_inputs
 
-    with accelerator.main_process_first():
-        processed_raw_datasets = raw_datasets.map(
-            tokenize_and_align_labels,
-            batched=True,
-            remove_columns=raw_datasets["train"].column_names,
-            desc="Running tokenizer on dataset",
-        )
 
-    train_dataset = processed_raw_datasets["train"]
-    eval_dataset = processed_raw_datasets["validation"]
+    # --------------------------------------------------------
+    # Process datasets
+    # --------------------------------------------------------
 
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    print("\nTokenizing dataset...")
 
-    # DataLoaders creation:
-    if args.pad_to_max_length:
-        # If padding was already done ot max length, we use the default data collator that will just convert everything
-        # to tensors.
-        data_collator = default_data_collator
-    else:
-        # Otherwise, `DataCollatorForTokenClassification` will apply dynamic padding for us (by padding to the maximum length of
-        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
-        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorForTokenClassification(
-            tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
-        )
+    processed_datasets = raw_datasets.map(
+        tokenize_and_align_labels,
+        batched=True,
+        remove_columns=[
+            "id",
+            "tokens",
+            "ner_tags",
+        ],
+    )
+
+
+    # --------------------------------------------------------
+    # Data collator
+    # --------------------------------------------------------
+
+    data_collator = DataCollatorForTokenClassification(
+        tokenizer=tokenizer
+    )
+
+
+    # --------------------------------------------------------
+    # DataLoaders
+    # --------------------------------------------------------
 
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        processed_datasets["train"],
+        shuffle=True,
+        batch_size=TRAIN_BATCH_SIZE,
+        collate_fn=data_collator,
     )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
+    validation_dataloader = DataLoader(
+        processed_datasets["validation"],
+        shuffle=False,
+        batch_size=EVAL_BATCH_SIZE,
+        collate_fn=data_collator,
+    )
+
+
+    # --------------------------------------------------------
     # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    # --------------------------------------------------------
 
-    # Use the device given by the `accelerator` object.
-    device = accelerator.device
-    model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
 
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
+
+    # --------------------------------------------------------
+    # Scheduler
+    # --------------------------------------------------------
+
+    total_steps = (
+        len(train_dataloader)
+        * NUM_EPOCHS
+    )
 
     lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
+        "linear",
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
+        num_warmup_steps=0,
+        num_training_steps=total_steps,
     )
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-    )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    # ========================================================
+    # Training
+    # ========================================================
 
-    # Figure out how many steps we should save the Accelerator states
-    checkpointing_steps = args.checkpointing_steps
-    if checkpointing_steps is not None and checkpointing_steps.isdigit():
-        checkpointing_steps = int(checkpointing_steps)
+    print("\n" + "=" * 60)
+    print("Start training")
+    print("=" * 60)
+    
+    best_val_loss = float("inf")
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("ner_no_trainer", experiment_config)
+    for epoch in range(NUM_EPOCHS):
 
-    # Metrics
-    metric = evaluate.load("seqeval")
+        model.train()
 
-    def get_labels(predictions, references):
-        # Transform predictions and references tensos to numpy arrays
-        if device.type == "cpu":
-            y_pred = predictions.detach().clone().numpy()
-            y_true = references.detach().clone().numpy()
-        else:
-            y_pred = predictions.detach().cpu().clone().numpy()
-            y_true = references.detach().cpu().clone().numpy()
+        total_loss = 0.0
 
-        # Remove ignored index (special tokens)
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        true_labels = [
-            [label_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        return true_predictions, true_labels
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}",
+        )
 
-    def compute_metrics():
-        results = metric.compute()
-        if args.return_entity_level_metrics:
-            # Unpack nested dictionaries
-            final_results = {}
-            for key, value in results.items():
-                if isinstance(value, dict):
-                    for n, v in value.items():
-                        final_results[f"{key}_{n}"] = v
-                else:
-                    final_results[key] = value
-            return final_results
-        else:
-            return {
-                "precision": results["overall_precision"],
-                "recall": results["overall_recall"],
-                "f1": results["overall_f1"],
-                "accuracy": results["overall_accuracy"],
+        for batch in progress_bar:
+
+            batch = {
+                key: value.to(device)
+                for key, value in batch.items()
             }
 
-    # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-    starting_epoch = 0
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            accelerator.print(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
-            accelerator.load_state(args.resume_from_checkpoint)
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
-
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-        else:
-            resume_step = int(training_difference.replace("step_", ""))
-            starting_epoch = resume_step // len(train_dataloader)
-            resume_step -= starting_epoch * len(train_dataloader)
-
-    for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
-        if args.with_tracking:
-            total_loss = 0
-        for step, batch in enumerate(train_dataloader):
-            # We need to skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == starting_epoch:
-                if resume_step is not None and step < resume_step:
-                    completed_steps += 1
-                    continue
             outputs = model(**batch)
+
             loss = outputs.loss
-            # We keep track of the loss at each epoch
-            if args.with_tracking:
-                total_loss += loss.detach().float()
-            loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
 
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    output_dir = f"step_{completed_steps }"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
+            total_loss += loss.item()
 
-            if completed_steps >= args.max_train_steps:
-                break
+            loss.backward()
+
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}"
+            )
+
+        average_loss = (
+            total_loss /
+            len(train_dataloader)
+        )
+
+
+        # ----------------------------------------------------
+        # Validation
+        # ----------------------------------------------------
 
         model.eval()
-        samples_seen = 0
-        
-        outputs4save = []
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            labels = batch["labels"]
-            if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                predictions = accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
-                labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-            predictions_gathered, labels_gathered = accelerator.gather((predictions, labels))
-            # If we are in a multiprocess environment, the last batch has duplicates
-            if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
-                    predictions_gathered = predictions_gathered[: len(eval_dataloader.dataset) - samples_seen]
-                    labels_gathered = labels_gathered[: len(eval_dataloader.dataset) - samples_seen]
-                else:
-                    samples_seen += labels_gathered.shape[0]
-            preds, refs = get_labels(predictions_gathered, labels_gathered)
-            metric.add_batch(
-                predictions=preds,
-                references=refs,
-            )  # predictions and preferences are expected to be a nested list of labels, not label_ids
-            
-            if epoch == (args.num_train_epochs - 1):
-                outputs4save.append([preds, refs])
-            
-        eval_metric = compute_metrics()
-        accelerator.print(f"epoch {epoch}:", eval_metric)
-        if args.with_tracking:
-            accelerator.log(
-                {
-                    "seqeval": eval_metric,
-                    "train_loss": total_loss.item() / len(train_dataloader),
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+        validation_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+
+            for batch in validation_dataloader:
+
+                batch = {
+                    key: value.to(device)
+                    for key, value in batch.items()
+                }
+
+                outputs = model(**batch)
+
+                validation_loss += (
+                    outputs.loss.item()
                 )
 
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
+                predictions = (
+                    outputs.logits.argmax(
+                        dim=-1
+                    )
+                )
 
-    if args.with_tracking:
-        accelerator.end_training()
+                labels = batch["labels"]
 
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+                mask = labels != -100
+
+                correct += (
+                    predictions[mask]
+                    == labels[mask]
+                ).sum().item()
+
+                total += mask.sum().item()
+
+
+        average_validation_loss = (
+            validation_loss
+            / len(validation_dataloader)
         )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+
+        
+        if average_validation_loss < best_val_loss:
+            best_val_loss = average_validation_loss
+            patience_counter = 0
+
+            model.save_pretrained(OUTPUT_DIR)
+            tokenizer.save_pretrained(OUTPUT_DIR)
+        else:
+
+            patience_counter += 1
+
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print(
+                    f"\nEarly stopping at epoch {epoch + 1}. "
+                    f"Best validation loss: {best_val_loss:.4f}"
+                )
+                break
+
+        accuracy = (
+            correct / total
+            if total > 0
+            else 0.0
+        )
+
+        print(
+            f"Epoch {epoch + 1}/{NUM_EPOCHS}"
+        )
 
 
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump(
-                {"eval_accuracy": eval_metric["accuracy"]}, f
-            )
-            
-        import pandas as pd
-        # Save predictions
-        out = pd.DataFrame(outputs4save)
-        out.to_csv(os.path.join(args.output_dir, "predictions.csv"), header=None, index=None)
+        writer.add_scalar(
+            "Learning_Rate",
+            optimizer.param_groups[0]["lr"],
+            epoch + 1
+        )
+
+        writer.add_scalar(
+            "Loss/train",
+            average_loss,
+            epoch + 1
+        )
+
+        writer.add_scalar(
+            "Loss/validation",
+            average_validation_loss,
+            epoch + 1
+        )
+
+        writer.add_scalar(
+            "Accuracy/validation",
+            accuracy,
+            epoch + 1
+        )
+
+    writer.close()
+
 
 if __name__ == "__main__":
     main()
