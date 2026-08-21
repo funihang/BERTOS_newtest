@@ -130,7 +130,7 @@ def main():
     if args.i is not None:
         print("Input formula -------> ", args.i)
         comp = Composition(args.i)        
-        comp_dict = comp.to_reduced_dict
+        comp_dict = comp.as_reduced_dict()
 
         input_seq = ""
         for ele in comp_dict.keys():
@@ -178,7 +178,7 @@ def main():
         all_outs = []
         for item in formulas:       
             comp = Composition(item)        
-            comp_dict = comp.to_reduced_dict
+            comp_dict = comp.as_reduced_dict()
             
             input_seq = ""
             for ele in comp_dict.keys():
