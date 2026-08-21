@@ -3,7 +3,8 @@
 BERTOS new version written to adapt to the new version of some packages.
 
 [Original Version](https://github.com/usccolumbia/BERTOS)
-[Online Toolbox](http://www.materialsatlas.org/bertos)
+
+[Online Toolbox](https://www.materialsatlas.org/apps/oxidation-states)
 
 ## Table of Contents
 - [Installations](#Installations)
@@ -87,7 +88,16 @@ We use the transformer model as implemented in Huggingface.
 
 ## Cite our work
 ```
-Fu, Nihang, Jeffrey Hu, Ying Feng, Gregory Morrison, Hans‐Conrad zur Loye, and Jianjun Hu. "Composition Based Oxidation State Prediction of Materials Using Deep Learning Language Models." Advanced Science (2023): 2301011. [PDF](https://arxiv.org/pdf/2211.15895)
+@article{fu2023composition,
+  title={Composition based oxidation state prediction of materials using deep learning language models},
+  author={Fu, Nihang and Hu, Jeffrey and Feng, Ying and Morrison, Gregory and Loye, Hans-Conrad zur and Hu, Jianjun},
+  journal={Advanced Science},
+  volume={10},
+  number={28},
+  pages={2301011},
+  year={2023},
+  publisher={Wiley Online Library}
+}
 
 ```
 
