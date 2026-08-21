@@ -27,28 +27,30 @@ conda create -n bertos  python=3.12
 conda activate bertos
 ```
 
-1. PyTorch for computers with Nvidia GPU.
-Go to pytorch histort installation and Select the version according to your CUDA version (recommend `pip install`).
+1. PyTorch for computers with NVIDIA GPU.
+Go to pytorch history installation and Select the version according to your CUDA version (recommend `pip install`).
 
-3. Other packagess
+3. Other packages
 ```
 pip install -r requirements.txt
 ```  
 
 ## Datasets  
-Our training process is carried out on our BERTOS datasets. Now we train our model on the updated `ICSD_CN` dataset.
+Release an updated version of `ICSD_CN` dataset.
+
+Pending: `ICSD`, `ICSD_oxide`, `ICSD_oxide_CN`
 
 ## Usage
 ### Training
-The command is to train a BERTOS model.  
+Train a BERTOS model (on the `ICSD_CN` dataset).  
 ```
 python train_BERTOS.py
 ```
 If you want to change the model setting, please check `./random_config/config.json`
 
-If you want to change the training setting, please check the hyperparameter setting in the `train_bertos.py` (since this is just a test instead of the official code, so Nihang have not  added the arguments)
+If you want to change the training setting, please check the hyperparameter setting in the `train_bertos.py` (since this is just a test instead of the official code, so Nihang have not  added arguments)
 
-### Predict
+### Predict Oxidation States
 Run `getOS.py` file to get predicted oxidation states for an input formula or input formulas.csv file containing multiple formulas. <br>
 Using default pretrained model (trained on ICSD_CN):
 ```
@@ -62,7 +64,7 @@ python getOS.py --f formulas.csv --model_name_or_path ./model_directory
 
 ```
 
-### Check charge neutrality for hypothetical formulas
+### Check Charge Neutrality
 Run `checkCN.py` file to check charge neutrality for an input formula or input formulas.csv file containing multiple formulas. <br>
 Using default pretrained model (trained on ICSD_CN):
 ```
